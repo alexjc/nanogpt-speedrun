@@ -9,8 +9,19 @@ def get(fname):
         hf_hub_download(repo_id="kjj0/fineweb10B-gpt2", filename=fname,
                         repo_type="dataset", local_dir=local_dir)
 get("fineweb_val_%06d.bin" % 0)
+
 num_chunks = 103 # full fineweb10B. Each chunk is 100M tokens
+
 if len(sys.argv) >= 2: # we can pass an argument to download less
     num_chunks = int(sys.argv[1])
-for i in range(1, num_chunks+1):
-    get("fineweb_train_%06d.bin" % i)
+
+
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor(max_workers=8) as executor:
+    futures = [
+        executor.submit(get, f"fineweb_train_{i:06d}.bin")
+        for i in range(1, num_chunks+1)
+    ]
+    for future in futures:
+        future.result() # Raise any exceptions that occurred
