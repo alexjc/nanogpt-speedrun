@@ -72,7 +72,7 @@ os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # init the tokenizer
 tokenmonster.set_local_directory(os.path.dirname(__file__))
-enc = tokenmonster.load_multiprocess_safe("./english-50256-balanced-v2.vocab")
+enc = tokenmonster.load("./english-50256-balanced-v2.vocab")
 eot = 50256
 
 def tokenize(docs):
@@ -91,7 +91,7 @@ def main():
     fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split="train")
 
     # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
-    nprocs = max(1, os.cpu_count()//4)
+    nprocs = 1 # max(1, os.cpu_count()//4)
     with mp.Pool(nprocs) as pool:
         shard_index = 0
         # preallocate buffer to hold current shard
@@ -99,7 +99,7 @@ def main():
         token_count = 0
         progress_bar = None
 
-        for tokens in pool.map(tokenize, fw.iter(batch_size=1024)):
+        for tokens in map(tokenize, fw.iter(batch_size=1024)):
             # is there enough space in the current shard for the new tokens?
             if token_count + len(tokens) < args.shard_size:
                 # simply append tokens to current shard
