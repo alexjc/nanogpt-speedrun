@@ -17,8 +17,10 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-flex_attention = torch.compile(flex_attention, dynamic=False)
-create_block_mask = torch.compile(create_block_mask, dynamic=False)
+
+if __name__ == "__main__":
+    flex_attention = torch.compile(flex_attention, dynamic=False)
+    create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
 flex_kernel_options = None
 if torch.cuda.get_device_name(0).endswith(("3090", "4090")):
@@ -264,7 +266,7 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, target, attn_blocksize):
+    def forward(self, idx, target=None, attn_blocksize=1024):
 
         docs = (idx == 50256).cumsum(0)
         def document_causal_mask(b, h, q_idx, kv_idx):
@@ -297,6 +299,10 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
+
+        if target is None:
+            return logits
+
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return loss
 
@@ -377,210 +383,215 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'data/fineweb-tokmon-10B/fineweb-tokmon_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb-tokmon-10B/fineweb-tokmon_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 16 # batch size, in sequences, across all devices
-    sequence_length : int = 32*1024 # sequence length, in tokens
-    num_iterations : int = 1750 # number of iterations to run
+    batch_size : int = 8 # batch size, in sequences, across all devices
+    sequence_length : int = 64*1024 # sequence length, in tokens
+    num_iterations : int = 1050 # number of iterations to run
     warmup_iters : int = 0
-    cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    cooldown_iters : int = 250 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int = 105 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
-# set up DDP (distributed data parallel). torchrun sets this env variable
-assert torch.cuda.is_available()
-dist.init_process_group(backend='nccl')
-ddp_rank = int(os.environ['RANK'])
-ddp_local_rank = int(os.environ['LOCAL_RANK'])
-ddp_world_size = int(os.environ['WORLD_SIZE'])
-device = f'cuda:{ddp_local_rank}'
-torch.cuda.set_device(device)
-print(f"using device: {device}")
-master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+def main():
+    # set up DDP (distributed data parallel). torchrun sets this env variable
+    assert torch.cuda.is_available()
+    dist.init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    print(f"using device: {device}")
+    master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-# begin logging
-logfile = None
-if master_process:
-    run_id = str(uuid.uuid4())
-    logdir = 'logs/%s/' % run_id
-    os.makedirs(logdir, exist_ok=True)
-    logfile = 'logs/%s.txt' % run_id
-    # create the log file
-    with open(logfile, "w") as f:
-        # begin the log by printing this file (the Python code)
-        f.write('='*100 + '\n')
-        f.write(code)
-        f.write('='*100 + '\n')
-def print0(s, logonly=False):
+    # begin logging
+    logfile = None
     if master_process:
-        with open(logfile, "a") as f:
-            if not logonly:
-                print(s)
-            f.write(s+'\n')
-# log information about the hardware/software environment this is running on
-# and print the full `nvidia-smi` to file
-print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
-import subprocess
-result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-print0(f'{result.stdout}', logonly=True)
-print0('='*100, logonly=True)
+        run_id = str(uuid.uuid4())
+        logdir = 'logs/%s/' % run_id
+        os.makedirs(logdir, exist_ok=True)
+        logfile = 'logs/%s.txt' % run_id
+        # create the log file
+        with open(logfile, "w") as f:
+            # begin the log by printing this file (the Python code)
+            f.write('='*100 + '\n')
+            f.write(code)
+            f.write('='*100 + '\n')
+    def print0(s, logonly=False):
+        if master_process:
+            with open(logfile, "a") as f:
+                if not logonly:
+                    print(s)
+                f.write(s+'\n')
+    # log information about the hardware/software environment this is running on
+    # and print the full `nvidia-smi` to file
+    print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
+    import subprocess
+    result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print0(f'{result.stdout}', logonly=True)
+    print0('='*100, logonly=True)
 
-# convenience variables
-T = args.sequence_length
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % (T * ddp_world_size) == 0
-val_steps = args.val_tokens // (T * ddp_world_size)
-# calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // ddp_world_size
+    # convenience variables
+    T = args.sequence_length
+    # calculate the number of steps to take in the val loop.
+    assert args.val_tokens % (T * ddp_world_size) == 0
+    val_steps = args.val_tokens // (T * ddp_world_size)
+    # calculate the steps of gradient accumulation required to attain the desired global batch size.
+    assert args.batch_size % (ddp_world_size) == 0
+    train_accumulation_steps = args.batch_size // ddp_world_size
 
-# load tokens
-train_loader = DistributedDataLoader(args.input_bin, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, T, ddp_rank, ddp_world_size)
-print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-print0('='*100, logonly=True)
-x, y = train_loader.next_batch()
+    # load tokens
+    train_loader = DistributedDataLoader(args.input_bin, T, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(args.input_val_bin, T, ddp_rank, ddp_world_size)
+    print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+    print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+    print0('='*100, logonly=True)
+    x, y = train_loader.next_batch()
 
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
-# this originates from Karpathy's experiments.
-num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
-model = model.cuda().bfloat16()
-for m in model.modules():
-    if isinstance(m, CastedLinear):
-        m.float()
-if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
-# here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module # always contains the "raw" unwrapped model
+    # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+    # this originates from Karpathy's experiments.
+    num_vocab = 50304
+    model = GPT(GPTConfig(vocab_size=num_vocab))
+    model = model.cuda().bfloat16()
+    for m in model.modules():
+        if isinstance(m, CastedLinear):
+            m.float()
+    if hasattr(config, "coordinate_descent_tuning"):
+        config.coordinate_descent_tuning = True # suggested by @Chillee
+    model = torch.compile(model)
+    # here we wrap model into DDP container
+    model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module # always contains the "raw" unwrapped model
 
-# init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
-params = list(raw_model.transformer.h.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
-# learning rate decay scheduler (linear warmup and cooldown)
-def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif it < args.num_iterations - args.cooldown_iters:
-        return 1.0
-    # 3) linear cooldown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.cooldown_iters
-        return decay_ratio
-schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+    # init the optimizer(s)
+    optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
+    optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
+    params = list(raw_model.transformer.h.parameters())
+    matrix_params = [p for p in params if p.ndim == 2]
+    scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+    optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
+    optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+    optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+    # learning rate decay scheduler (linear warmup and cooldown)
+    def get_lr(it):
+        assert it <= args.num_iterations
+        # 1) linear warmup for warmup_iters steps
+        if it < args.warmup_iters:
+            return (it+1) / args.warmup_iters
+        # 2) constant lr for a while
+        elif it < args.num_iterations - args.cooldown_iters:
+            return 1.0
+        # 3) linear cooldown
+        else:
+            decay_ratio = (args.num_iterations - it) / args.cooldown_iters
+            return decay_ratio
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-# Start training loop
-training_time_ms = 0
-# start the clock
-torch.cuda.synchronize()
-t0 = time.time()
-t1 = None
-# begin training
-for step in range(args.num_iterations + 1):
-    last_step = (step == args.num_iterations)
-    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-    # steps with dummy data first, and then re-initialize the model and reset the loader.
-    if step == 10:
-        training_time_ms = 0
-        t0 = time.time()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+    # Start training loop
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.time()
+    t1 = None
+    # begin training
+    for step in range(args.num_iterations + 1):
+        last_step = (step == args.num_iterations)
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step == 10:
+            training_time_ms = 0
+            t0 = time.time()
+        timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Set the attention blocksize for the current step, in chunks of 64. By @fernbear.bsky.social
-    attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
+        # Set the attention blocksize for the current step, in chunks of 64. By @fernbear.bsky.social
+        attn_blocksize = torch.tensor(64*((step/args.num_iterations * (1792 - 64) + 64)//64), dtype=torch.int, device='cuda')
 
-    # once in a while evaluate the validation dataset
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
-        # run validation batches
-        model.eval()
-        val_loader.reset()
-        val_loss = 0.0
-        for _ in range(val_steps):
-            with torch.no_grad():
-                x_val, y_val = val_loader.next_batch()
-                val_loss += model(x_val, y_val, attn_blocksize=attn_blocksize)
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
-        # log val loss to console and to logfile
-        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.time()
+        # once in a while evaluate the validation dataset
+        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.time() - t0)
+            # run validation batches
+            model.eval()
+            val_loader.reset()
+            val_loss = 0.0
+            for _ in range(val_steps):
+                with torch.no_grad():
+                    x_val, y_val = val_loader.next_batch()
+                    val_loss += model(x_val, y_val, attn_blocksize=attn_blocksize)
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            val_loss /= val_steps
+            # log val loss to console and to logfile
+            print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.time()
 
-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.time() - t0)
-        # save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.time()
+        if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.time() - t0)
+            # save the state of the training process
+            log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.time()
 
-    # bit confusing: we want to make sure to eval on 0th iteration
-    # but also after the very last iteration. so we loop for step <= num_iterations
-    # instead of just < num_iterations (one extra due to <=), only to do
-    # the validation/sampling one last time, and then we break right here as we're done.
-    if last_step:
-        break
+        # bit confusing: we want to make sure to eval on 0th iteration
+        # but also after the very last iteration. so we loop for step <= num_iterations
+        # instead of just < num_iterations (one extra due to <=), only to do
+        # the validation/sampling one last time, and then we break right here as we're done.
+        if last_step:
+            break
 
-    # --------------- TRAINING SECTION BEGIN -----------------
-    model.train()
-    for i in range(1, train_accumulation_steps+1):
-        ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
-        with ctx: # there's no need to sync gradients every accumulation step
-            # forward pass
-            loss = model(x, y, attn_blocksize=attn_blocksize)
-            # advance the dataset for the next batch
-            x, y = train_loader.next_batch()
-            # backward pass
-            loss.backward()
-        train_loss = loss.detach()
-    for p in model.parameters():
-        p.grad /= train_accumulation_steps
-    # momentum warmup for Muon
-    frac = min(step/300, 1)
-    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        sched.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
-    # --------------- TRAINING SECTION END -------------------
-    # everything that follows now is just diagnostics, prints, logging, etc.
+        # --------------- TRAINING SECTION BEGIN -----------------
+        model.train()
+        for i in range(1, train_accumulation_steps+1):
+            ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
+            with ctx: # there's no need to sync gradients every accumulation step
+                # forward pass
+                loss = model(x, y, attn_blocksize=attn_blocksize)
+                # advance the dataset for the next batch
+                x, y = train_loader.next_batch()
+                # backward pass
+                loss.backward()
+            train_loss = loss.detach()
+        for p in model.parameters():
+            p.grad /= train_accumulation_steps
+        # momentum warmup for Muon
+        frac = min(step/300, 1)
+        optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers and schedulers
+        for opt, sched in zip(optimizers, schedulers):
+            opt.step()
+            sched.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+        # --------------- TRAINING SECTION END -------------------
+        # everything that follows now is just diagnostics, prints, logging, etc.
 
-    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-    approx_time = training_time_ms + 1000 * (time.time() - t0)
-    step_time = (time.time() - t1) * 1000.0 if t1 is not None else float('-inf')
-    token_rate = args.batch_size * args.sequence_length * 1000.0 / step_time
-    print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms rate:{token_rate:.2f}tok/s")
-    t1 = time.time()
+        #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        step_time = (time.time() - t1) * 1000.0 if t1 is not None else float('-inf')
+        token_rate = args.batch_size * args.sequence_length * 1000.0 / step_time
+        print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms rate:{token_rate:.2f}tok/s")
+        t1 = time.time()
 
-if master_process:
-    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    if master_process:
+        print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
-# -------------------------------------------------------------------------
-# clean up nice
-dist.destroy_process_group()
+    # -------------------------------------------------------------------------
+    # clean up nice
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
