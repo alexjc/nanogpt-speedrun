@@ -383,8 +383,8 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb-tokmon-10B/fineweb-tokmon_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb-tokmon-10B/fineweb-tokmon_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 16 # batch size, in sequences, across all devices
-    sequence_length : int = 32*1024 # sequence length, in tokens
+    batch_size : int = 8 # batch size, in sequences, across all devices
+    sequence_length : int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1375 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 450 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
