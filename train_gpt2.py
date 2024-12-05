@@ -26,9 +26,6 @@ flex_kernel_options = None
 if torch.cuda.get_device_name(0).endswith(("3090", "4090")):
     flex_kernel_options = {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32}
 
-torch.manual_seed(1234567)
-torch.cuda.manual_seed_all(1234567)
-
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -386,16 +383,17 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb-tokmon-10B/fineweb-tokmon_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb-tokmon-10B/fineweb-tokmon_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8 # batch size, in sequences, across all devices
-    sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1050 # number of iterations to run
+    batch_size : int = 16 # batch size, in sequences, across all devices
+    sequence_length : int = 32*1024 # sequence length, in tokens
+    num_iterations : int = 1375 # number of iterations to run
     warmup_iters : int = 0
-    cooldown_iters : int = 250 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    cooldown_iters : int = 450 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    val_loss_every : int = 105 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    orig_val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens : int = 8_519_680
+    save_every : int = 125 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
 def main():
@@ -528,6 +526,7 @@ def main():
                     val_loss += model(x_val, y_val, attn_blocksize=attn_blocksize)
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             val_loss /= val_steps
+            val_loss = val_loss.item() * args.val_tokens / args.orig_val_tokens
             # log val loss to console and to logfile
             print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             # start the clock again
