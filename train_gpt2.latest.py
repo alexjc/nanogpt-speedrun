@@ -1,30 +1,35 @@
 import os
 import sys
-
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-import contextlib
-import time
 import uuid
+import time
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch._inductor.config as config
-import torch.distributed as dist
+from torch import nn
 import torch.nn.functional as F
-from torch import Tensor, nn
-
+import torch.distributed as dist
+import torch._inductor.config as config
+from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-from torch.nn.parallel import DistributedDataParallel as DDP
+
+flex_kernel_options = None
+if torch.cuda.get_device_name(0).endswith(("3090", "4090")):
+    flex_kernel_options = {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32}
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
+def zeropower_via_svd(G, steps=None):
+    U, S, V = G.svd()
+    return U @ V.T
+
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7) -> Tensor:
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -48,6 +53,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7) -> Tensor:
         X = X.T
     return X
 
+zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -70,19 +77,23 @@ class Muon(torch.optim.Optimizer):
         lr: The learning rate used by the internal SGD.
         momentum: The momentum used by the internal SGD.
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
+        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
+        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        params: "list[Tensor]" = [*params]
-        assert all(isinstance(p, Tensor) for p in params)
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5):
+        self.num_process = int(os.environ['WORLD_SIZE'])
+        self.rank = int(os.environ["RANK"])
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        params: "list[torch.Tensor]" = list(params)
+        assert all(isinstance(p, torch.Tensor) for p in params)
         sizes = {p.numel() for p in params}
         param_groups = [
             {
-                'params': [p for p in params if p.numel() == size],
-                'update_buffer': [
-                    torch.empty(size, device='cuda', dtype=torch.bfloat16)
-                    for _ in range(world_size)
+                "params": [p for p in params if p.numel() == size],
+                "update_buffer": [
+                    torch.empty(size, device="cuda", dtype=torch.bfloat16)
+                    for _ in range(self.num_process)
                 ],
             }
             for size in sizes
@@ -91,13 +102,15 @@ class Muon(torch.optim.Optimizer):
 
     def step(self):
         for group in self.param_groups:
-            lr = group['lr']
-            momentum = group['momentum']
-            nesterov = group['nesterov']
-            ns_steps = group['ns_steps']
-            update_buffers: "list[Tensor]" = group['update_buffer']
+            lr: float = group["lr"]
+            momentum: float = group["momentum"]
+            nesterov: bool = group["nesterov"]
+            zeropower_backend = zeropower_backends[group["backend"]]
+            backend_steps: int = group["backend_steps"]
+            update_buffers: "list[torch.Tensor]" = group["update_buffer"]
             # generate weight updates in distributed fashion
-            params: "list[Tensor]" = group['params']
+            params: "list[torch.Tensor]" = group["params"]
+            assert len(params) % self.num_process == 0
             handle = None
             params_world = None
             def update_prev():
@@ -110,24 +123,22 @@ class Muon(torch.optim.Optimizer):
                         g_world.view_as(p_world),
                         alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
                     )
-            for base_i in range(len(params))[::world_size]:
-                if base_i + rank < len(params):
-                    p = params[base_i + rank]
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf: Tensor = state['momentum_buffer']
-                    buf.lerp_(g, 1 - momentum)
-                    g = g.lerp_(buf, momentum) if nesterov else buf
-                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
-                else:
-                    g = update_buffers[rank]
+            for base_i in range(len(params))[::self.num_process]:
+                p = params[base_i + self.rank]
+                g = p.grad
+                assert g is not None
+                state = self.state[p] 
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf: torch.Tensor = state["momentum_buffer"]
+                buf.lerp_(g, 1 - momentum)
+                g = g.lerp_(buf, momentum) if nesterov else buf
+                g = zeropower_backend(g, steps=backend_steps).flatten()
                 update_prev()
                 handle = dist.all_gather(update_buffers, g, async_op=True)
-                params_world = params[base_i : base_i + world_size]
+                params_world = params[base_i : base_i + self.num_process]
             update_prev()
+
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -136,69 +147,77 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
+
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
 
     def forward(self, x):
-        return F.linear(x, self.weight.type_as(x))
+        return F.linear(x, self.weight.to(x.dtype))
 
-class Rotary(nn.Module):
-    def __init__(self, dim, max_seq_len=65536):
+class Rotary(torch.nn.Module):
+
+    def __init__(self, dim, base=10000):
         super().__init__()
-        inv_freq = (1 / 1024) ** torch.linspace(0.0, 1.0, steps=dim // 4, dtype=torch.float32)
-        inv_freq = torch.cat([inv_freq, inv_freq.new_zeros(dim // 4)])
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum("i, j -> ij", t, inv_freq)
-        self.cos = nn.Buffer(theta.cos(), persistent=False)
-        self.sin = nn.Buffer(theta.sin(), persistent=False)
+        self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, dim, 2) / dim))
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
 
-    def forward(self, x: Tensor):
-        cos, sin = self.cos[None, :x.size(-3), None, :], self.sin[None, :x.size(-3), None, :]
-        x1, x2 = x.to(dtype=torch.float32).chunk(2, dim=-1)
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            t = torch.arange(seq_len, device=x.device)
+            freqs = torch.outer(t, self.inv_freq)
+            self.seq_len_cached = seq_len
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
+        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        # apply_rotary_emb(x, cos, sin)
+        x1, x2 = x.chunk(2, dim=3)
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x)
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim, n_head):
         super().__init__()
-        assert dim % num_heads == 0
-        self.num_heads = num_heads
+        assert dim % n_head == 0
+        self.n_head = n_head
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
-        self.rotary = Rotary(dim // num_heads) # dim // num_heads = head_dim
+        # value residual lambda
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5])) # @Grad62304977
+        # rotary embeddings
+        self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
+        # output projection
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x: Tensor, vi: Tensor | None, block_mask: BlockMask):
+    def forward(self, x: torch.Tensor, vi: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q = self.c_q(x).view(B, T, self.num_heads, -1)
-        k = self.c_k(x).view(B, T, self.num_heads, -1)
-        v = self.c_v(x).view(B, T, self.num_heads, -1)
-        if vi is None:
-            v = self.lambdas[0] * v
-        else:
-            v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @KoszarskyB & @Grad62304977
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q: torch.Tensor = self.c_q(x).view(B, T, self.n_head, -1)
+        k: torch.Tensor = self.c_k(x).view(B, T, self.n_head, -1)
+        v: torch.Tensor = self.c_v(x).view(B, T, self.n_head, -1)
+        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v) # @Grad62304977
+        q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, kernel_options=flex_kernel_options)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
 
 class MLP(nn.Module):
 
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         self.c_fc   = CastedLinear(dim, 4 * dim)
         self.c_proj = CastedLinear(4 * dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
@@ -206,40 +225,17 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config: "GPTConfig", layer_idx: int):
+    def __init__(self, config):
         super().__init__()
-        if layer_idx != 7:
-            self.attn = CausalSelfAttention(config.model_dim, config.num_heads)
-        self.mlp = MLP(config.model_dim)
+        self.attn = CausalSelfAttention(config.n_embd, config.n_head)
+        self.mlp = MLP(config.n_embd)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
-        self.layer_idx = layer_idx
 
-    def forward(self, x, vi, x0, block_mask):
+    def forward(self, x: torch.Tensor, vi: torch.Tensor, x0: torch.Tensor, block_mask: BlockMask) -> torch.Tensor:
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        if self.layer_idx != 7:
-            x = x + self.attn(norm(x), vi, block_mask)
+        x = x + self.attn(norm(x), vi, block_mask)
         x = x + self.mlp(norm(x))
         return x
-
-class ValueEmbedding(nn.Module):
-    def __init__(self, config: "GPTConfig"):
-        super().__init__()
-        self.__setattr__
-        self.embed = nn.ModuleList([
-            nn.Embedding(config.vocab_size, config.model_dim)
-            for _ in range(3)
-        ])
-
-    def forward(self, inputs) -> "list[Tensor | None]":
-        ve = [emb(inputs) for emb in self.embed]
-        ve = [
-            ve[0], ve[1], ve[2],
-            None, None, None,
-            None, None, None,
-            ve[0], ve[1], ve[2],
-        ]
-        return ve
-
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -247,101 +243,85 @@ class ValueEmbedding(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size : int = 50304
-    num_layers : int = 12
-    num_heads : int = 6 # head dim 128 suggested by @Grad62304977
-    model_dim : int = 768
+    n_layer : int = 12
+    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_embd : int = 768
+    lm_head_softcap : int = 30
 
 class GPT(nn.Module):
 
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.num_layers = config.num_layers
+        self.n_layer = config.n_layer
+        self.lm_head_softcap = config.lm_head_softcap
 
         # U-net design by @brendanh0gan
-        self.num_encoder_layers = config.num_layers // 2 # Half of the layers for encoder
-        self.num_decoder_layers = config.num_layers - self.num_encoder_layers # Remaining for decoder
+        self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
+        self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
 
-        self.embed = nn.Embedding(config.vocab_size, config.model_dim)
-        self.blocks = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.num_layers)])
-        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
-        # U-net structure on token value embeddings by @leloykun
-        self.value_embeds = ValueEmbedding(config)
-        self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
+            # U-net structure on token value embeddings by @leloykun
+            vte = nn.Embedding(config.vocab_size, config.n_embd*self.num_encoder_layers),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+        ))
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(
-        self,
-        inputs: Tensor,
-        targets: Tensor,
-        sliding_window_num_blocks: Tensor,
-    ):
+    def forward(self, idx: torch.Tensor, target: torch.Tensor, sliding_window: torch.Tensor) -> torch.Tensor:
         BLOCK_SIZE = 128
-        assert inputs.ndim == 1
-        docs = (inputs == 50256).cumsum(0)
-        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
-
-        def document_causal(b, h, q_idx, kv_idx):
+        assert idx.ndim == 1
+        docs = (idx == 50256).cumsum(0)
+        docs_low = docs.reshape(-1, BLOCK_SIZE)[:, 0].contiguous()
+        docs_high = docs.reshape(-1, BLOCK_SIZE)[:, -1].contiguous()
+        def document_sliding_window_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
             document_mask = docs[q_idx] == docs[kv_idx]
-            return causal_mask & document_mask
-        
-        def dense_to_ordered(dense_mask: Tensor):
-            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
-            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+            window_mask = q_idx - kv_idx < sliding_window
+            return causal_mask & document_mask & window_mask
 
-        def create_doc_swc_block_mask(sliding_window_num_blocks: Tensor):
-            kv_idx = block_idx = torch.arange(512, dtype=torch.int32, device="cuda")
+        S = len(idx)
+        def create_sliding_window_causal_mask(S: int, sliding_window: torch.Tensor):
+            kv_idx = block_idx = torch.arange(S // BLOCK_SIZE, dtype=torch.int32, device="cuda")
             q_idx = block_idx[:, None]
-            causal_bm = q_idx >= kv_idx
-            causal_full_bm = q_idx > kv_idx
-            window_bm = q_idx - kv_idx < sliding_window_num_blocks
-            window_full_bm = window_bm
-            # document_bm = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
-            document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
-            document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
-            nonzero_bm = causal_bm & window_bm & document_bm
-            full_bm  = causal_full_bm & window_full_bm & document_full_bm
-            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm & ~full_bm)
-            full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
-            return BlockMask.from_kv_blocks(
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_causal,
-            )
-
-        block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
+            causal_mask = q_idx >= kv_idx
+            document_mask = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
+            window_mask = q_idx - kv_idx < ((sliding_window + BLOCK_SIZE - 1) // BLOCK_SIZE)
+            dense_mask = causal_mask & document_mask & window_mask
+            dense_mask = dense_mask.to(torch.int32)
+            num_blocks = dense_mask.sum(dim=-1).to(torch.int32)
+            indices = torch.argsort(dense_mask, dim=-1, descending=True, stable=True).to(torch.int32)
+            num_blocks = num_blocks[None, None, :].contiguous()
+            indices = indices[None, None, :].contiguous()
+            return BlockMask.from_kv_blocks(num_blocks, indices, BLOCK_SIZE=BLOCK_SIZE, mask_mod=document_sliding_window_causal)
+        block_mask = create_sliding_window_causal_mask(S, sliding_window)
 
         # forward the GPT model itself
-        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
+        x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
         x = norm(x) # @Grad62304977
         x0 = x
-        ve = self.value_embeds(inputs)
-        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+        vi = self.transformer.vte(idx[None]).chunk(self.num_encoder_layers, dim=-1)
 
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, ve_enc[i], x0, block_mask)
+            x = self.transformer.h[i](x, vi[i], x0, block_mask)
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.num_decoder_layers):
             x = x + self.skip_weights[i] * skip_connections.pop()
             # U-net structure on token value embeddings by @leloykun
-            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
+            x = self.transformer.h[self.num_encoder_layers + i](x, vi[self.num_encoder_layers-1-i], x0, block_mask)
 
         x = norm(x)
         logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = self.lm_head_softcap * torch.tanh(logits / self.lm_head_softcap) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
         return loss
 
 # -----------------------------------------------------------------------------
@@ -355,28 +335,28 @@ def _peek_data_shard(file: Path):
     assert header[1] == 1, "unsupported version"
     return int(header[2]) # number of tokens (claimed)
 
-def _load_data_shard(path: Path, num_tokens):
-    with path.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+def _load_data_shard(file: Path, ntok: int):
+    with file.open("rb") as f:
+        tokens = torch.empty(ntok, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header?"
+        assert nbytes == 2 * ntok, "number of tokens read does not match header?"
     return tokens
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, seq_len, process_rank, num_processes):
+    def __init__(self, filename_pattern, T, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
-        self.seq_len = seq_len
+        self.T = T
 
         # glob files that match the pattern
         self.files = sorted(Path.cwd().glob(filename_pattern))
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
         # load and validate all data shards, count number of tokens in total
-        self.files_num_tokens = [_peek_data_shard(file) for file in self.files]
-        assert min(self.files_num_tokens) >= num_processes * seq_len + 1
-        self.total_num_tokens = sum(self.files_num_tokens)
+        self.ntoks = [_peek_data_shard(file) for file in self.files]
+        assert min(self.ntoks) >= num_processes * T + 1
+        self.ntok_total = sum(self.ntoks)
 
         self.reset()
 
@@ -386,21 +366,21 @@ class DistributedDataLoader:
 
     def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.seq_len
-        self.tokens = _load_data_shard(self.files[self.current_shard], self.files_num_tokens[self.current_shard])
+        self.current_position = self.process_rank * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard], self.ntoks[self.current_shard])
 
     def next_batch(self):
-        batch_size = self.seq_len * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position+self.seq_len+1]
+        batch_size = self.T * self.num_processes
+        buf = self.tokens[self.current_position:self.current_position+self.T+1]
         # host side async is sufficient;
         # no performance improvement was observed when introducing a separate stream.
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
+        x = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # inputs
+        y = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # targets
         # advance current position and load next shard if necessary
         self.current_position += batch_size
         if self.current_position + batch_size + 1 >= len(self.tokens):
             self.advance()
-        return inputs, targets
+        return x, y
 
 # -----------------------------------------------------------------------------
 # int main
@@ -408,99 +388,95 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'data/fineweb-tokmon-10B/fineweb-tokmon_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb-tokmon-10B/fineweb-tokmon_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8 # batch size, in sequences, across all devices
-    sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1490 # number of iterations to run
+    batch_size : int = 16 # batch size, in sequences, across all devices
+    sequence_length : int = 32*1024 # sequence length, in tokens
+    num_iterations : int = 1480 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 600 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens : int = 8_323_072 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_ratio : float = 0.793248915672302
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
-rank = int(os.environ['RANK'])
-local_rank = int(os.environ['LOCAL_RANK'])
-world_size = int(os.environ['WORLD_SIZE'])
 assert torch.cuda.is_available()
-device = torch.device(f"cuda:{local_rank}")
+dist.init_process_group(backend='nccl')
+ddp_rank = int(os.environ['RANK'])
+ddp_local_rank = int(os.environ['LOCAL_RANK'])
+ddp_world_size = int(os.environ['WORLD_SIZE'])
+device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
 print(f"using device: {device}")
-dist.init_process_group(backend='nccl', device_id=device)
-dist.barrier()
-master_process = (rank == 0) # this process will do logging, checkpointing etc.
+master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
 logfile = None
 if master_process:
-    run_id = uuid.uuid4()
-    logdir = Path("logs") / f"{run_id}"
-    # logdir.mkdir(parents=True, exist_ok=True)
-    logfile = Path("logs") / f"{run_id}.txt"
-    print(logfile.stem)
+    run_id = str(uuid.uuid4())
+    logdir = 'logs/%s/' % run_id
+    # os.makedirs(logdir, exist_ok=True)
+    logfile = 'logs/%s.txt' % run_id
     # create the log file
-    with logfile.open("w") as f:
+    with open(logfile, "w") as f:
         # begin the log by printing this file (the Python code)
-        print(code, file=f)
-        print("=" * 100, file=f)
+        f.write(code)
+        f.write('='*100 + '\n')
 def print0(s, logonly=False):
     if master_process:
-        with logfile.open("a") as f:
-            # if not logonly:
-            #     print(s)
-            print(s, file=f)
+        with open(logfile, "a") as f:
+            if not logonly:
+                print(s)
+            f.write(s+'\n')
 # log information about the hardware/software environment this is running on
 # and print the full `nvidia-smi` to file
-print0(f"Running python {sys.version}")
 print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
 import subprocess
-
 result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 print0(f'{result.stdout}', logonly=True)
 print0('='*100, logonly=True)
 
+# convenience variables
+T = args.sequence_length
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % (args.sequence_length * world_size) == 0
-val_steps = args.val_tokens // (args.sequence_length * world_size)
+assert args.val_tokens % (T * ddp_world_size) == 0
+val_steps = args.val_tokens // (T * ddp_world_size)
 # calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (world_size) == 0
-train_accumulation_steps = args.batch_size // world_size
+assert args.batch_size % (ddp_world_size) == 0
+train_accumulation_steps = args.batch_size // ddp_world_size
 
 # load tokens
-train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, rank, world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, rank, world_size)
-print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
-print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
+train_loader = DistributedDataLoader(args.input_bin, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, T, ddp_rank, ddp_world_size)
+print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 print0('='*100, logonly=True)
-inputs_train, targets_train = train_loader.next_batch()
+x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
-config.coordinate_descent_tuning = True # suggested by @Chillee
-# config.max_autotune = True
-# config.cpp_wrapper = True
-model: nn.Module = torch.compile(model)
+if hasattr(config, "coordinate_descent_tuning"):
+    config.coordinate_descent_tuning = True # suggested by @Chillee
+model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
+model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
-assert isinstance(raw_model, nn.Module)
 
 # init the optimizer(s)
-embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
-optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight, raw_model.transformer.vte.weight], lr=0.6, betas=(0.8, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
-params = list(raw_model.blocks.parameters())
+params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
@@ -521,8 +497,8 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-sliding_window_num_blocks = torch.tensor(1, dtype=torch.int32, device="cuda")
-sw_num_blocks_prev = 1
+sliding_window_size = torch.tensor(64, dtype=torch.int32, device="cuda")
+sw_size_prev = 64
 # Start training loop
 training_time_ms = 0
 # start the clock
@@ -539,12 +515,11 @@ for step in range(args.num_iterations + 1):
         t0 = time.perf_counter()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Linearly increase the sliding window size over training in chunks of 64 from 64 -> 1792. By @fernbear.bsky.social
-    frac_done = step / args.num_iterations # training progress
-    sw_num_blocks = int(((1 - frac_done) * 64 + frac_done * 1792 + 64) // 128)
-    if sw_num_blocks != sw_num_blocks_prev:
-        sliding_window_num_blocks.copy_(sw_num_blocks, non_blocking=True)
-        sw_num_blocks_prev = sw_num_blocks
+    # Set the sliding window size for the current step, in chunks of 64. By @fernbear.bsky.social
+    sw_size =  64 * int((64 + (1792 - 64) * step / args.num_iterations) // 64)
+    if sw_size != sw_size_prev:
+        sliding_window_size.copy_(sw_size, non_blocking=True)
+        sw_size_prev = sw_size
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
@@ -557,29 +532,26 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
-                inputs_val, targets_val = val_loader.next_batch()
-                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
+                x_val, y_val = val_loader.next_batch()
+                val_loss += model(x_val, y_val, sliding_window=sliding_window_size)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
+        val_loss = (val_loss / val_steps) * args.val_ratio
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
-        for name, module in raw_model.named_modules():
-            if isinstance(module, CausalSelfAttention):
-                print0(f"{name} {module.lambdas}")
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-    # if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
-    #     # stop the clock
-    #     torch.cuda.synchronize()
-    #     training_time_ms += 1000 * (time.perf_counter() - t0)
-    #     # save the state of the training process
-    #     log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-    #     torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-    #     # start the clock again
-    #     torch.cuda.synchronize()
-    #     t0 = time.perf_counter()
+    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
+        # save the state of the training process
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        # torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
 
     # bit confusing: we want to make sure to eval on 0th iteration
     # but also after the very last iteration. so we loop for step <= num_iterations
@@ -590,19 +562,20 @@ for step in range(args.num_iterations + 1):
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
-    for i in range(1, train_accumulation_steps + 1):
-        with contextlib.ExitStack() as stack:
-            if i < train_accumulation_steps: # there's no need to sync gradients every accumulation step
-                stack.enter_context(model.no_sync())
-            if step >= 5:
-                stack.enter_context(torch.compiler.set_stance(skip_guard_eval_unsafe=True))
-            loss = model(inputs_train, targets_train, sliding_window_num_blocks)
+
+    for i in range(1, train_accumulation_steps+1):
+        ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
+        with ctx: # there's no need to sync gradients every accumulation step
+            # forward pass
+            loss = model(x, y, sliding_window=sliding_window_size)
+            # backward pass
             loss.backward()
-            del loss
-            inputs_train, targets_train = train_loader.next_batch()
-    if train_accumulation_steps != 1:
-        for p in model.parameters():
-            p.grad /= train_accumulation_steps
+            # advance the dataset for the next batch
+            x, y = train_loader.next_batch()
+        train_loss = loss.detach()
+    for p in model.parameters():
+        p.grad /= train_accumulation_steps
+
     # momentum warmup for Muon
     frac = min(step/300, 1)
     for group in optimizer3.param_groups:
@@ -618,10 +591,8 @@ for step in range(args.num_iterations + 1):
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
-print0(
-    f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-    f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-)
+if master_process:
+    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
 # -------------------------------------------------------------------------
 # clean up nice
