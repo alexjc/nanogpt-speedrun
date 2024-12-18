@@ -244,9 +244,18 @@ class ValueEmbedding(nn.Module):
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
 
+with torch.no_grad():
+    import tokenmonster
+    tokenmonster.set_local_directory("data")
+    token_enc = tokenmonster.load("./english-28416-balanced-v1b2.vocab")
+    token_vocab = token_enc.get_dictionary()
+    assert len(token_vocab) == 28415
+    token_length = torch.tensor([len(v['token_decoded'].encode('utf-8')) for v in token_vocab.values()]+[0], dtype=torch.float32).clamp(min=1)
+    token_eot = 28415
+
 @dataclass
 class GPTConfig:
-    vocab_size : int = 50304
+    vocab_size : int = 28416
     num_layers : int = 12
     num_heads : int = 6 # head dim 128 suggested by @Grad62304977
     model_dim : int = 768
@@ -276,10 +285,11 @@ class GPT(nn.Module):
         inputs: Tensor,
         targets: Tensor,
         sliding_window_num_blocks: Tensor,
+        reduction = 'mean',
     ):
         BLOCK_SIZE = 128
         assert inputs.ndim == 1
-        docs = (inputs == 50256).cumsum(0)
+        docs = (inputs == token_eot).cumsum(0)
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
         docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
 
@@ -341,7 +351,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction=reduction)
         return loss
 
 # -----------------------------------------------------------------------------
@@ -408,8 +418,8 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'data/fineweb-tokmon-10B/english-28416-balanced/fineweb-tokmon_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb-tokmon-10B/english-28416-balanced/fineweb-tokmon_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     sequence_length : int = 64*1024 # sequence length, in tokens
@@ -419,7 +429,8 @@ class Hyperparameters:
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens : int = 8_912_896 # equivalent text used for validation but with TokenMonster
+    val_ratio : float = 0.85798889 # exact ratio of tokens for the validation shard
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
@@ -479,10 +490,7 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_to
 print0('='*100, logonly=True)
 inputs_train, targets_train = train_loader.next_batch()
 
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
-# this originates from Karpathy's experiments.
-num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768))
+model = GPT(GPTConfig())
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -554,15 +562,22 @@ for step in range(args.num_iterations + 1):
         # run validation batches
         model.eval()
         val_loader.reset()
-        val_loss = 0.0
+        val_loss_bpb, val_loss_npt = 0.0, 0.0
+
+        tok_len = token_length.cuda()
         for _ in range(val_steps):
             with torch.no_grad():
                 inputs_val, targets_val = val_loader.next_batch()
-                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
+                ce = model(inputs_val, targets_val, sliding_window_num_blocks, reduction='none')
+                val_loss_npt += ce.mean()
+                val_loss_bpb += (ce / tok_len[targets_val]).mean()
+        dist.all_reduce(val_loss_bpb, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_loss_npt, op=dist.ReduceOp.AVG)
+        val_loss_bpb = (val_loss_bpb / val_steps) / 0.693147180559945 # np.log(2.0)
+        val_loss_npt = (val_loss_npt / val_steps) * args.val_ratio
+
         # log val loss to console and to logfile
-        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        print0(f'step:{step}/{args.num_iterations} val_loss[approx]:{val_loss_npt:.4f}npt val_loss[exact]:{val_loss_bpb:.4f}bpb train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
         for name, module in raw_model.named_modules():
             if isinstance(module, CausalSelfAttention):
                 print0(f"{name} {module.lambdas}")
