@@ -10,7 +10,7 @@ def get(fname):
                         repo_type="dataset", local_dir=local_dir)
 get("fineweb-tokmon_val_%06d.bin" % 0)
 
-num_chunks = 83
+num_chunks = 88
 
 if len(sys.argv) >= 2: # we can pass an argument to download less
     num_chunks = int(sys.argv[1])
@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 with ThreadPoolExecutor(max_workers=8) as executor:
     futures = [
-        executor.submit(get, f"fineweb-tokmon_train_{i:06d}.bin")
+        executor.submit(get, f"english-28416-balanced/fineweb-tokmon_train_{i:06d}.bin")
         for i in range(1, num_chunks+1)
     ]
     for future in futures:
