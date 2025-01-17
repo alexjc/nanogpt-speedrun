@@ -33,6 +33,7 @@ The validation set of HellaSwag has a total of 10,042 examples.
 import os
 import json
 import math
+import random
 import requests
 import tiktoken
 import tokenmonster
@@ -85,7 +86,7 @@ def download(split):
         download_file(data_url, data_filename)
 
 
-def render_example(example):
+def render_example(example, token_eot):
     """
     Given the example as a dictionary, render it as three torch tensors:
     - tokens (the tokens of context + completion, of size 4xN, as there are always 4 candidates)
@@ -110,7 +111,7 @@ def render_example(example):
     mask_rows = []
     for end in endings:
         end_tokens = enc_encode(" " + end) # note: prepending " " because GPT-2 tokenizer
-        tok_rows.append(ctx_tokens + end_tokens + [50256])
+        tok_rows.append(ctx_tokens + end_tokens + [token_eot])
         mask_rows.append([0]*len(ctx_tokens) + [1]*len(end_tokens) + [0])
         data["ending_tokens"].append(end_tokens)
 
@@ -118,7 +119,7 @@ def render_example(example):
     tokens = torch.cat([torch.tensor(row) for row in tok_rows], dim=0)
     mask = torch.cat([torch.tensor(row) for row in mask_rows], dim=0)
     # pad to next multiple of 32
-    pad_to = math.ceil(len(tokens) / 32) * 32
+    pad_to = math.ceil(len(tokens) / 128) * 128
     tokens = F.pad(tokens, (0, pad_to - len(tokens)))
     mask = F.pad(mask, (0, pad_to - len(mask)))
 
@@ -129,20 +130,29 @@ def iterate_examples(split):
     download(split)
     with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
         examples = [json.loads(line) for line in f]
-        import random
+
+        # NOTE: The order of the original dataset is not random, so the score ends up
+        # changing significantly over the course of the evaluation.  By randomizing it
+        # the script will output a more reasonable estimate of the final score earlier
+        # on during the evaluation
         random.seed(12345)
         random.shuffle(examples)
         for e in examples:
             yield e
 
+from functools import lru_cache
+@lru_cache(1)
+def sw_num_blks(window_size: int):
+    return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
 @torch.no_grad()
-def evaluate(model_type, device):
+def evaluate(model_type, device, token_eot=28415):
 
     torch.set_float32_matmul_precision('high') # use tf32
 
     # NOTE: This assumes that train_gpt2.py has a main() function and doesn't do anything when imported as a module.
-    from train_gpt2 import GPT, GPTConfig
-    model = GPT(GPTConfig())
+    from train_gpt2 import GPT
+    model = GPT(vocab_size=28416, num_layers=12, num_heads=6, model_dim=768)
     model.load_state_dict({k.replace('_orig_mod.', ''): v for k, v in torch.load(model_type, map_location="cpu")["model"].items()})
     model.to(device)
 
@@ -151,14 +161,14 @@ def evaluate(model_type, device):
     num_correct = 0
     num_total = 0
     for example in iterate_examples("val"):
-        data, tokens, mask, label = render_example(example)
+        data, tokens, mask, label = render_example(example, token_eot)
         datas.append(data)
 
         tokens = tokens.to(device)
         mask = mask.to(device)
 
         # get the logits
-        logits = model(tokens).squeeze(0)
+        logits = model(tokens, sliding_window_num_blocks=sw_num_blks(1024)).squeeze(0)
 
         # evaluate the autoregressive loss at all positions
         shift_logits = logits[:-1, :].contiguous()
@@ -171,15 +181,15 @@ def evaluate(model_type, device):
         shift_mask = mask[1:]
         masked_shift_losses = shift_losses * shift_mask
 
-        # Find indices of EOT tokens (50256)
-        eot_indices = (tokens == 50256).nonzero().squeeze()
+        # Find indices of EOT tokens
+        eot_indices = (tokens == token_eot).nonzero().squeeze()
 
         # Calculate ranges between EOT tokens for the 4 samples
         ranges = []
         start = 0
         for i in range(4):
             end = eot_indices[i].item() if i < len(eot_indices) else len(tokens[0])
-            assert tokens[end] == 50256
+            assert tokens[end] == token_eot
             ranges.append((start, end-1)) # exclude EOT token
             start = end + 1
 
@@ -215,7 +225,7 @@ def evaluate(model_type, device):
         num_correct += int(pred == label)
         num_correct_norm += int(pred_norm == label)
         if num_total % 100 == 0:
-            print(f"{num_total} acc: {num_correct/num_total:.4f} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}", end="\r")
+            print(f"\r{num_total} acc: {num_correct/num_total:.4f} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}", end="")
 
         # debug: pretty print a few examples, and the losses in each case
         # if num_total % 100 == 1:
@@ -226,7 +236,7 @@ def evaluate(model_type, device):
         #         print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
         #     print(f"predicted: {pred_norm}, actual: {label}")
 
-    print('MODEL', model_type)
+    print('\rMODEL', model_type)
     print(f"{num_total} acc: {num_correct/num_total:.4f} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}")
 
 
@@ -236,7 +246,7 @@ if __name__ == "__main__":
     parser.add_argument("-m", "--models", type=str, nargs="+", help="the model .pt files to evaluate")
     parser.add_argument("-d", "--device", type=str, default="cuda:0", help="the device to use")
     parser.add_argument("-t", "--tokenizer", type=str, default="tokenmonster", choices=["tiktoken", "tokenmonster"], help="tokenizer to use")
-    parser.add_argument("-v", "--vocabulary", type=str, default="./english-50256-balanced-v2", help="vocabulary file to use") 
+    parser.add_argument("-v", "--vocabulary", type=str, default="english-28416-balanced-v1b4", help="vocabulary file to use") 
     args = parser.parse_args()
 
     if args.tokenizer == "tiktoken":
