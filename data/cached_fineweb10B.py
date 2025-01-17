@@ -8,9 +8,9 @@ def get(fname):
     if not os.path.exists(os.path.join(local_dir, fname)):
         hf_hub_download(repo_id="alexjc/fineweb-tokmon-10B", filename=fname,
                         repo_type="dataset", local_dir=local_dir)
-get("fineweb-tokmon_val_%06d.bin" % 0)
+get("english-28416-balanced/fineweb-tokmon_val_%06d.bin" % 0)
 
-num_chunks = 88
+num_chunks = 101
 
 if len(sys.argv) >= 2: # we can pass an argument to download less
     num_chunks = int(sys.argv[1])
