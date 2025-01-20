@@ -417,7 +417,7 @@ class GPT(nn.Module):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
         x = norm(x)
-        logits = self.lm_head(x) if not self.training else lm_head_fp8(x, self.lm_head.weight)
+        logits = self.lm_head(x) # if not self.training else lm_head_fp8(x, self.lm_head.weight)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
 
@@ -465,7 +465,7 @@ class Hyperparameters:
     # data
     train_files = "data/fineweb-tokmon-10B/english-28416-balanced/fineweb-tokmon_train_*.bin" # input .bin to train on
     val_files = "data/fineweb-tokmon-10B/english-28416-balanced/fineweb-tokmon_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10420224 # fewer tokens but equivalent text for validation, snapped to nearest seq_len
+    val_tokens = 10485760 # fewer tokens but equivalent text for validation, snapped to nearest seq_len
     val_ratio = 0.99011 # equivalent token density on validation tokens to that of GPT-2
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
@@ -475,7 +475,7 @@ class Hyperparameters:
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
     seq_len = 64*1024 # FlexAttention sequence length
-    save_checkpoint = True
+    save_checkpoint = False
 args = Hyperparameters()
 
 
