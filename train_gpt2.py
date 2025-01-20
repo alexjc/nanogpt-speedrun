@@ -417,7 +417,7 @@ class GPT(nn.Module):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
         x = norm(x)
-        logits = self.lm_head(x) # if not self.training else lm_head_fp8(x, self.lm_head.weight)
+        logits = self.lm_head(x) if not self.training else lm_head_fp8(x, self.lm_head.weight)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
 
