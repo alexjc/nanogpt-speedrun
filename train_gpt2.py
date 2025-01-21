@@ -353,7 +353,7 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128))
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor = None, sliding_window_num_blocks: Tensor = 0):
+    def forward(self, input_seq: Tensor, target_seq: Tensor = None, sliding_window_num_blocks: Tensor = 0, return_raw=False):
         BLOCK_SIZE = 128
         assert input_seq.ndim == 1
         assert len(input_seq) % BLOCK_SIZE == 0
@@ -424,8 +424,10 @@ class GPT(nn.Module):
         if target_seq is None:
             return logits
 
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
-        return loss
+        if return_raw:
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='none'), logits
+        else:
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -463,13 +465,13 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "data/fineweb-tokmon-10B/english-28416-balanced/fineweb-tokmon_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb-tokmon-10B/english-28416-balanced/fineweb-tokmon_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # fewer tokens but equivalent text for validation, snapped to nearest seq_len
-    val_ratio = 0.99011 # equivalent token density on validation tokens to that of GPT-2
+    train_files = "data/fineweb-tokmon-10B/english-28416-balanced-v1/fineweb-tokmon_train_*.bin" # input .bin to train on
+    val_files = "data/fineweb-tokmon-10B/english-28416-balanced-v1/fineweb-tokmon_val_*.bin" # input .bin to eval validation loss on
+    val_tokens = 10485760 # equivalent tokens used for validation snapped to nearest batch_size
+    val_ratio = 0.99157220 # equivalent token density on validation tokens to that of GPT-2
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
-    num_iterations = 1393 # number of iterations to run
+    num_iterations = 1425 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -489,6 +491,16 @@ def main():
     dist.init_process_group(backend="nccl", device_id=device)
     dist.barrier()
     master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+    try:
+        import tokenmonster
+        tokenmonster.set_local_directory("data")
+        token_enc = tokenmonster.load("./english-28416-balanced-v1.vocab")
+        token_vocab = token_enc.get_dictionary()
+        assert len(token_vocab) == 28415
+        token_lengths = torch.tensor([len(v['token_decoded'].encode('utf-8')) for v in token_vocab.values()]+[0], dtype=torch.float32).clamp(min=1).cuda()
+    except ImportError:
+        token_lengths = None
 
     # begin logging
     logfile = None
@@ -582,15 +594,28 @@ def main():
             assert args.val_tokens % val_bs == 0
             val_steps = args.val_tokens // val_bs
             val_loader = distributed_data_generator(args.val_files, val_bs, rank, world_size)
-            val_loss = 0
+            val_loss_bpb, val_loss_npt, val_acc, val_bytes = 0.0, 0.0, 0.0, 0.0
+
             with torch.no_grad():
                 for _ in range(val_steps):
                     x, y = next(val_loader)
-                    val_loss += model(x, y, sw_num_blks(window_size))
-            val_loss = (val_loss * args.val_ratio) / val_steps
+                    ce, logits = model(x, y, sw_num_blks(window_size), return_raw=True)
+                    val_loss_npt += ce.mean()
+                    val_loss_bpb += (ce / token_lengths[y]).mean() if token_lengths is not None else float('NaN')
+                    val_bytes += token_lengths[y].sum()
+                    val_acc += ((logits.argmax(dim=-1) == y).float() * token_lengths[y]).sum()
+                    del logits
+                    del ce
+
+            val_acc = val_acc * 100.0 / val_bytes
+            val_loss_bpb = (val_loss_bpb / val_steps) / 0.693147180559945 # np.log(2.0)
+            val_loss_npt = (val_loss_npt * args.val_ratio) / val_steps
             del val_loader
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
+            dist.all_reduce(val_loss_bpb, op=dist.ReduceOp.AVG)
+            dist.all_reduce(val_loss_npt, op=dist.ReduceOp.AVG)
+            dist.all_reduce(val_acc, op=dist.ReduceOp.AVG)
+
+            print0(f"step:{step}/{train_steps} val_loss[approx]:{val_loss_npt:.4f}npt val_loss[exact]:{val_loss_bpb:.4f}bpb val_acc:{val_acc:.2f}% train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
             model.train()
             # start the clock again
             torch.cuda.synchronize()
