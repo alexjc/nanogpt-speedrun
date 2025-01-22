@@ -624,6 +624,8 @@ for step in range(train_steps + 1):
             for dst_name, dst_param in dst_block.named_parameters():
                 src_param = dict(src_block.named_parameters())[dst_name]
                 dst_param.copy_(src_param)
+            dst_block.mlp.c_proj.weight.data.mul_(0.1)
+            if dst_block.attn is not None: dst_block.attn.c_proj.weight.data.mul_(0.1)
 
             # Copy from second half blocks backward
             src_block = model.blocks[15 - block_idx]
@@ -632,6 +634,8 @@ for step in range(train_steps + 1):
             for dst_name, dst_param in dst_block.named_parameters():
                 src_param = dict(src_block.named_parameters())[dst_name]
                 dst_param.copy_(src_param)
+            dst_block.mlp.c_proj.weight.data.mul_(0.1)
+            if dst_block.attn is not None: dst_block.attn.c_proj.weight.data.mul_(0.1)
 
     # force all-depth compiles in the first 7 step
     if step <= 7:
