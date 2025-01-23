@@ -446,14 +446,16 @@ class DistributedDataGenerator:
 
     def __init__(self, filename_pattern: str, batch_size: int, rank : int, world_size : int):
         self.files = sorted(Path.cwd().glob(filename_pattern))
+        self.total = None
         self.reset_batch_size(batch_size, world_size)
-    
+
     def reset_batch_size(self, batch_size, world_size):
         assert batch_size % world_size == 0
         self.batch_size = batch_size
         self.local_batch_size = batch_size // world_size
 
     def __iter__(self):
+        self.total = 0
         file_iter = iter(self.files) # use itertools.cycle(files) instead if you want to do multi-epoch training
         tokens, pos = _load_data_shard(next(file_iter)), 0
         while True:
@@ -463,6 +465,7 @@ class DistributedDataGenerator:
             inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
             targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
             pos += self.batch_size
+            self.total += self.batch_size
             yield inputs, targets
 
 # -----------------------------------------------------------------------------
@@ -478,9 +481,9 @@ class Hyperparameters:
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
     num_iterations = 8192 # number of iterations to run
-    cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
+    cooldown_frac = 0.125 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 256 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 128 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
     seq_len = 64*1024 # FlexAttention sequence length
     save_checkpoint = False
@@ -541,7 +544,7 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-k = 1.08
+k = 1.1
 adam_params = [dict(params=head_params, lr=0.003*k), dict(params=embed_params, lr=0.3*k), dict(params=scalar_params, lr=0.015*k)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
@@ -594,7 +597,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 x, y = next(val_loader)
-                val_loss += model(x, y, sw_num_blks(window_size))
+                val_loss += model(x, y, sw_num_blks(1792))
         val_loss = val_loss * args.val_ratio / val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -620,7 +623,7 @@ for step in range(train_steps + 1):
             # Copy from first half blocks forward
             src_block = model.blocks[block_idx + 0]
             dst_block = model.blocks[block_idx + 1]
-            print0(f"COPY BLOCK {block_idx + 0} TO {block_idx + 1}")
+            print0(f"COPY BLOCK {block_idx + 0} TO {block_idx + 1}", console=True)
             for dst_name, dst_param in dst_block.named_parameters():
                 src_param = dict(src_block.named_parameters())[dst_name]
                 dst_param.copy_(src_param)
@@ -630,7 +633,7 @@ for step in range(train_steps + 1):
             # Copy from second half blocks backward
             src_block = model.blocks[15 - block_idx]
             dst_block = model.blocks[14 - block_idx]
-            print0(f"COPY BLOCK {15 - block_idx} TO {14 - block_idx}")
+            print0(f"COPY BLOCK {15 - block_idx} TO {14 - block_idx}", console=True)
             for dst_name, dst_param in dst_block.named_parameters():
                 src_param = dict(src_block.named_parameters())[dst_name]
                 dst_param.copy_(src_param)
@@ -644,13 +647,19 @@ for step in range(train_steps + 1):
     else:
         num_layers = min(1+(step//1024), 8)
 
-    batch_multiplier = [None, 4, 4, 2, 2, 2, 1, 1, 1]
+    batch_multiplier = [None, 4, 2, 2, 2, 1, 1, 1, 1]
     train_loader.reset_batch_size(args.batch_size * batch_multiplier[num_layers], world_size)
     seq_len = args.seq_len * batch_multiplier[num_layers]
 
     inputs, targets = next(train_loader_iter)
     for input_seq, target_seq in zip(inputs.split(seq_len), targets.split(seq_len)):
         model(input_seq, target_seq, sw_num_blks(window_size), num_layers=num_layers).backward()
+
+    # Set gradients to None for all parameters in blocks[1:-1] during initial compilation steps
+    if step <= 7:
+        for block in model.blocks[1:-1]:
+            for param in block.parameters():
+                param.grad = None
 
     for param in model.parameters():
         if param.grad is not None:
@@ -673,6 +682,8 @@ for step in range(train_steps + 1):
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-    f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
+    console=True
 )
+print0(f"tokens: {train_loader.total:,}", console=True)
 dist.destroy_process_group()
