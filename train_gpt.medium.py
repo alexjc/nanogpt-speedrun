@@ -396,7 +396,7 @@ class GPT(nn.Module):
                     BLOCK_SIZE=BLOCK_SIZE,
                     mask_mod=document_causal,
                 )
-            return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
+            return build_bm(sliding_window_num_blocks), build_bm(128)
 
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         long_bm, short_bm = create_doc_swc_block_masks(sliding_window_num_blocks)
@@ -410,7 +410,7 @@ class GPT(nn.Module):
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm]
+        block_masks = [short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
         for i in range(min(self.num_encoder_layers, num_layers)):
             x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
             skip_connections.append(x)
@@ -481,7 +481,7 @@ class Hyperparameters:
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
     num_iterations = 8192 # number of iterations to run
-    cooldown_frac = 0.125 # fraction of training spent cooling down the learning rate
+    cooldown_frac = 0.25 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 128 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
@@ -581,13 +581,14 @@ for step in range(train_steps + 1):
     timed_steps = float("nan") if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
     # Linearly increase the block-wise sliding window size over training 128 -> 1792:
-    # increase by @fernbear.bsky.social; block-wise by @YouJiacheng; square by @alexjc
-    window_size = next_multiple_of_n(1792 * ((step % 1024) / 1024) ** 2, n=128)
+    # increase by @fernbear.bsky.social; block-wise by @YouJiacheng; stagewise by @alexjc
+    window_size = next_multiple_of_n(1792 * ((max(0, step-1024) % 1024) / 1024), n=128)
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
+        window_size = next_multiple_of_n(1792 * ((max(0, step-1025) % 1024) / 1024), n=128)
         model.eval()
         val_bs = world_size * args.seq_len
         assert args.val_tokens % val_bs == 0
@@ -597,11 +598,11 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 x, y = next(val_loader)
-                val_loss += model(x, y, sw_num_blks(1792))
+                val_loss += model(x, y, sw_num_blks(window_size))
         val_loss = val_loss * args.val_ratio / val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss[approx]:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
+        print0(f"step:{step}/{train_steps} val_loss[approx]:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms window_size:{window_size}", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -617,8 +618,8 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION BEGIN -----------------
     # Copy parameters between blocks at specified steps
-    if step in [1024, 2048, 3072, 4096, 5120, 6144, 7168]:
-        block_idx = (step - 1024) // 1024
+    if step in [2048, 3072, 4096, 5120]:
+        block_idx = 3 + (step - 2048) // 1024
         with torch.no_grad():
             # Copy from first half blocks forward
             src_block = model.blocks[block_idx + 0]
@@ -641,13 +642,13 @@ for step in range(train_steps + 1):
             if dst_block.attn is not None: dst_block.attn.c_proj.weight.data.mul_(0.1)
 
     # force all-depth compiles in the first 7 step
-    if step <= 7:
-        num_layers = 1+step
+    if step <= 5:
+        num_layers = 3+step
     # progressive growing beyond step 7
     else:
-        num_layers = min(1+(step//1024), 8)
+        num_layers = min(3+max(0,step-1024)//1024, 8)
 
-    batch_multiplier = [None, 4, 2, 2, 2, 1, 1, 1, 1]
+    batch_multiplier = [None, None, None, 3, 2, 2, 1, 1, 1]
     train_loader.reset_batch_size(args.batch_size * batch_multiplier[num_layers], world_size)
     seq_len = args.seq_len * batch_multiplier[num_layers]
 
@@ -655,9 +656,9 @@ for step in range(train_steps + 1):
     for input_seq, target_seq in zip(inputs.split(seq_len), targets.split(seq_len)):
         model(input_seq, target_seq, sw_num_blks(window_size), num_layers=num_layers).backward()
 
-    # Set gradients to None for all parameters in blocks[1:-1] during initial compilation steps
-    if step <= 7:
-        for block in model.blocks[1:-1]:
+    # Set gradients to None for all parameters in blocks[3:-3] during initial compilation steps
+    if step <= 5:
+        for block in model.blocks[3:-3]:
             for param in block.parameters():
                 param.grad = None
 
@@ -677,8 +678,8 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    if (step+1)%5==0 or step < 10:
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
+    if (step+1)%25==0 or step < 10:
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms num_layers:{num_layers}x2", console=True)
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
