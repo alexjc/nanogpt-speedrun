@@ -480,13 +480,13 @@ class Hyperparameters:
     val_ratio = 0.99157220
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
-    num_iterations = 8192 # number of iterations to run
-    cooldown_frac = 0.25 # fraction of training spent cooling down the learning rate
+    num_iterations = 4352 # number of iterations to run
+    cooldown_frac = 0.5 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 128 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
     seq_len = 64*1024 # FlexAttention sequence length
-    save_checkpoint = False
+    save_checkpoint_every = 0
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -544,7 +544,7 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-k = 1.1
+k = 1.25
 adam_params = [dict(params=head_params, lr=0.003*k), dict(params=embed_params, lr=0.3*k), dict(params=scalar_params, lr=0.015*k)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
@@ -554,7 +554,12 @@ optimizers = [optimizer1, optimizer2]
 
 # learning rate schedule: stable then decay
 def get_lr(it: int):
-    t = 1 - it / args.num_iterations # time remaining in training
+    if it <= 512:
+        num_iter = 512
+    else:
+        it = (it-512) % 768
+        num_iter = 768
+    t = 1 - it / num_iter # time remaining in this phase
     assert 1 >= t >= 0
     w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
     return w * 1.0 + (1 - w) * 0.1
@@ -580,15 +585,13 @@ for step in range(train_steps + 1):
         t0 = time.perf_counter()
     timed_steps = float("nan") if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Linearly increase the block-wise sliding window size over training 128 -> 1792:
-    # increase by @fernbear.bsky.social; block-wise by @YouJiacheng; stagewise by @alexjc
-    window_size = next_multiple_of_n(1792 * ((max(0, step-1024) % 1024) / 1024), n=128)
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
-        window_size = next_multiple_of_n(1792 * ((max(0, step-1025) % 1024) / 1024), n=128)
+        window_upper = 256 + 256 * max(0, (step+255) / 768)
+        window_size = next_multiple_of_n(window_upper * ((step+255) % 768) / 768, n=128)
         model.eval()
         val_bs = world_size * args.seq_len
         assert args.val_tokens % val_bs == 0
@@ -608,18 +611,18 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-    if last_step:
-        if master_process and args.save_checkpoint:
+    if last_step or (step > 0 and args.save_checkpoint_every > 0 and step % args.save_checkpoint_every == 0):
+        if master_process:
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
-        break
+        if last_step: break
 
     # --------------- TRAINING SECTION BEGIN -----------------
     # Copy parameters between blocks at specified steps
-    if step in [2048, 3072, 4096, 5120]:
-        block_idx = 3 + (step - 2048) // 1024
+    if step in [512, 512+768*1, 512+768*2, 512+768*3]:
+        block_idx = 3 + (step - 512) // 768
         with torch.no_grad():
             # Copy from first half blocks forward
             src_block = model.blocks[block_idx + 0]
@@ -641,20 +644,33 @@ for step in range(train_steps + 1):
             dst_block.mlp.c_proj.weight.data.mul_(0.1)
             if dst_block.attn is not None: dst_block.attn.c_proj.weight.data.mul_(0.1)
 
+    # Linearly increase the block-wise sliding window size over training 128 -> 1792:
+    # increase by @fernbear.bsky.social; block-wise by @YouJiacheng; stagewise by @alexjc
+    window_upper = 256 + 256 * max(0, (step+256) / 768)
+    window_size = next_multiple_of_n(window_upper * ((step+256) % 768) / 768, n=128)
+
     # force all-depth compiles in the first 7 step
     if step <= 5:
         num_layers = 3+step
     # progressive growing beyond step 7
     else:
-        num_layers = min(3+max(0,step-1024)//1024, 8)
+        if step <= 512:
+            num_layers = 3
+        else:
+            num_layers = min(4+max(0,step-512)//768, 8)
 
-    batch_multiplier = [None, None, None, 3, 2, 2, 1, 1, 1]
+    batch_multiplier = [None, None, None, 2, 2, 2, 1, 1, 1]
     train_loader.reset_batch_size(args.batch_size * batch_multiplier[num_layers], world_size)
     seq_len = args.seq_len * batch_multiplier[num_layers]
 
+    total_loss = 0
     inputs, targets = next(train_loader_iter)
     for input_seq, target_seq in zip(inputs.split(seq_len), targets.split(seq_len)):
-        model(input_seq, target_seq, sw_num_blks(window_size), num_layers=num_layers).backward()
+        loss = model(input_seq, target_seq, sw_num_blks(window_size), num_layers=num_layers)
+        loss.backward()
+        total_loss += loss.item()
+
+    total_loss = total_loss * world_size * args.seq_len / args.batch_size
 
     # Set gradients to None for all parameters in blocks[3:-3] during initial compilation steps
     if step <= 5:
@@ -664,10 +680,12 @@ for step in range(train_steps + 1):
 
     for param in model.parameters():
         if param.grad is not None:
+            if batch_multiplier[num_layers] != 1:
+                param.grad.mul_(batch_multiplier[num_layers])
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 
     # momentum warmup for Muon
-    frac = min(step / 300, 1)
+    frac = min(step / 150, 1)
     for group in optimizer2.param_groups:
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
     # step the optimizers and schedulers
@@ -678,8 +696,7 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    if (step+1)%25==0 or step < 10:
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms num_layers:{num_layers}x2", console=True)
+    print0(f"step:{step+1}/{train_steps} train_loss:{total_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms window_size:{window_size} num_layers:{num_layers*2}", console=True)
 
 print0(
     f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
