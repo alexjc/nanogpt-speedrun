@@ -1,5 +1,6 @@
 import os
 import sys
+import random
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
@@ -22,6 +23,9 @@ torch._dynamo.config.recompile_limit = 12 # each progressive expansion of the tr
 flex_kernel_options = None
 if torch.cuda.get_device_name(0).endswith(("3090", "4090")):
     flex_kernel_options = {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32}
+
+torch.manual_seed(12345)
+torch.cuda.manual_seed_all(12345)
 
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul for lm_head by @YouJiacheng
@@ -421,11 +425,11 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
         assert len(skip_connections) == 0
         x = norm(x)
-        logits = self.lm_head(x) if not self.training else lm_head_fp8(x, self.lm_head.weight) 
+        logits = self.lm_head(x) # if not self.training else lm_head_fp8(x, self.lm_head.weight) 
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
-        return loss
+        return F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='none')
+
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -448,11 +452,53 @@ class DistributedDataGenerator:
         self.files = sorted(Path.cwd().glob(filename_pattern))
         self.total = None
         self.reset_batch_size(batch_size, world_size)
+        self.replay_chunks = []
 
     def reset_batch_size(self, batch_size, world_size):
         assert batch_size % world_size == 0
         self.batch_size = batch_size
         self.local_batch_size = batch_size // world_size
+
+    @torch.no_grad()
+    def feedback(self, tokens, losses):
+        tokens = tokens.cpu()
+        losses = losses.cpu()
+        doc_boundaries = [-1] + (tokens == 28415).nonzero().squeeze(1).tolist() + [len(tokens)]
+
+        # Insert additional splits if documents are too long (>192 tokens)
+        new_boundaries = []
+        for start, end in zip(doc_boundaries[:-1], doc_boundaries[1:]):
+            if start + 1 >= end: continue
+            new_boundaries.append(start)
+            cur = start + 192
+            while cur < end - 96:
+                new_boundaries.append(cur)
+                cur += 192
+        if start+1 != end: new_boundaries.append(end)
+        doc_boundaries = new_boundaries
+
+        doc_start = doc_boundaries[:-1]
+        doc_end = doc_boundaries[1:]
+
+        # Calculate average cross entropy for each chunk.
+        doc_losses = []
+        for start, end in zip(doc_start, doc_end):
+            if start+1 == end:
+                print('NO', start+1, end)
+            else:
+                doc_losses.append(losses[start+1:end].mean())
+
+        random.shuffle(self.replay_chunks)
+
+        # Get indices of top N highest losses
+        top_indices = sorted(range(len(doc_losses)), key=lambda i: doc_losses[i], reverse=True)[:12]
+
+        # Extract tokens for each of the worst docs
+        for worst_doc_idx in top_indices:
+            worst_tokens = tokens[doc_start[worst_doc_idx]+1:doc_end[worst_doc_idx]]
+            worst_tokens[-1] = 28415
+            self.replay_chunks.append(worst_tokens)
+
 
     def __iter__(self):
         self.total = 0
@@ -462,6 +508,16 @@ class DistributedDataGenerator:
             if pos + self.batch_size + 1 >= len(tokens):
                 tokens, pos = _load_data_shard(next(file_iter)), 0
             buf = tokens[pos + rank * self.local_batch_size:][:self.local_batch_size + 1]
+
+            if len(self.replay_chunks) > 8 * 320:
+                # Inject 12 document chunks into the buffer.
+                idx = 0
+                for _ in range(12):
+                    difficult_doc = self.replay_chunks.pop(0)
+                    assert idx + len(difficult_doc) <= len(buf)
+                    buf[idx:idx + len(difficult_doc)] = difficult_doc
+                    idx += len(difficult_doc)
+
             inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
             targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
             pos += self.batch_size
@@ -481,11 +537,11 @@ class Hyperparameters:
     # optimization
     batch_size = 8*64*1024 # batch size in tokens
     num_iterations = 4352 # number of iterations to run
-    cooldown_frac = 0.5 # fraction of training spent cooling down the learning rate
+    cooldown_frac = 768/4352 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
-    seq_len = 64*1024 # FlexAttention sequence length
+    seq_len = 16*1024 # FlexAttention sequence length
     save_checkpoint_every = 0
 args = Hyperparameters()
 
@@ -544,7 +600,7 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
-k = 1.25
+k = 1.35
 adam_params = [dict(params=head_params, lr=0.003*k), dict(params=embed_params, lr=0.3*k), dict(params=scalar_params, lr=0.015*k)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
@@ -590,8 +646,8 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
-        window_upper = 256 + 256 * max(0, (step+255) / 768)
-        window_size = next_multiple_of_n(window_upper * ((step+255) % 768) / 768, n=128)
+        window_upper = 256 + 256 * max(0, (step-512) / 768)
+        window_size = next_multiple_of_n(window_upper * (max(0, step-512) % 768) / 768, n=128)
         model.eval()
         val_bs = world_size * args.seq_len
         assert args.val_tokens % val_bs == 0
@@ -601,7 +657,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 x, y = next(val_loader)
-                val_loss += model(x, y, sw_num_blks(window_size))
+                val_loss += model(x, y, sw_num_blks(window_size)).mean()
         val_loss = val_loss * args.val_ratio / val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -620,8 +676,21 @@ for step in range(train_steps + 1):
         if last_step: break
 
     # --------------- TRAINING SECTION BEGIN -----------------
+    # force all-depth compiles in the first 7 step
+    if step <= 5:
+        num_layers = 3+step
+    # progressive growing beyond step 7
+    else:
+        if step <= 512:
+            num_layers = 3
+        else:
+            num_layers = min(4+max(0,step-512)//768, 8)
+
+    # batch_multiplier = [None, None, None, 2, 2, 2, 1, 1, 1]
+    batch_multiplier = [None, None, None, 2, 2, 2, 1, 1, 1]
+
     # Copy parameters between blocks at specified steps
-    if step in [512, 512+768*1, 512+768*2, 512+768*3]:
+    if step in [512, 512+768*1, 512+768*2, 512+768*3, 512+768*4]:
         block_idx = 3 + (step - 512) // 768
         with torch.no_grad():
             # Copy from first half blocks forward
@@ -644,30 +713,31 @@ for step in range(train_steps + 1):
             dst_block.mlp.c_proj.weight.data.mul_(0.1)
             if dst_block.attn is not None: dst_block.attn.c_proj.weight.data.mul_(0.1)
 
+        # Scale learning rates by batch multiplier
+        for group in optimizer1.param_groups:
+            if "original_lr" not in group: group["original_lr"] = group["initial_lr"]
+            group["initial_lr"] = group["original_lr"] * batch_multiplier[num_layers]
+        for group in optimizer2.param_groups:
+            if "original_lr" not in group: group["original_lr"] = group["initial_lr"]
+            group["initial_lr"] = group["original_lr"] * batch_multiplier[num_layers]
+
     # Linearly increase the block-wise sliding window size over training 128 -> 1792:
     # increase by @fernbear.bsky.social; block-wise by @YouJiacheng; stagewise by @alexjc
-    window_upper = 256 + 256 * max(0, (step+256) / 768)
-    window_size = next_multiple_of_n(window_upper * ((step+256) % 768) / 768, n=128)
+    window_upper = 256 + 256 * max(0, (step-512) / 768)
+    window_size = next_multiple_of_n(window_upper * (max(0, step-512) % 768) / 768, n=128)
 
-    # force all-depth compiles in the first 7 step
-    if step <= 5:
-        num_layers = 3+step
-    # progressive growing beyond step 7
-    else:
-        if step <= 512:
-            num_layers = 3
-        else:
-            num_layers = min(4+max(0,step-512)//768, 8)
-
-    batch_multiplier = [None, None, None, 2, 2, 2, 1, 1, 1]
     train_loader.reset_batch_size(args.batch_size * batch_multiplier[num_layers], world_size)
     seq_len = args.seq_len * batch_multiplier[num_layers]
 
     total_loss = 0
     inputs, targets = next(train_loader_iter)
     for input_seq, target_seq in zip(inputs.split(seq_len), targets.split(seq_len)):
-        loss = model(input_seq, target_seq, sw_num_blks(window_size), num_layers=num_layers)
+        ce = model(input_seq, target_seq, sw_num_blks(window_size), num_layers=num_layers)
+        loss = ce.mean()
         loss.backward()
+
+        train_loader.feedback(input_seq, ce)
+
         total_loss += loss.item()
 
     total_loss = total_loss * world_size * args.seq_len / args.batch_size
@@ -680,8 +750,6 @@ for step in range(train_steps + 1):
 
     for param in model.parameters():
         if param.grad is not None:
-            if batch_multiplier[num_layers] != 1:
-                param.grad.mul_(batch_multiplier[num_layers])
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 
     # momentum warmup for Muon
