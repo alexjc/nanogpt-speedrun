@@ -21,7 +21,6 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-torch._dynamo.config.recompile_limit = 12 # each progressive expansion of the transformer (7) + one for val results in a compile
 
 flex_kernel_options = None
 if torch.cuda.get_device_name(0).endswith(("3090", "4090")):
@@ -380,9 +379,9 @@ class GPT(nn.Module):
                 mask_mod=document_causal,
             )
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
-        return build_bm(sliding_window_num_blocks), build_bm(128)
+        return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, num_layers: int = None):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -501,14 +500,12 @@ class DistributedDataGenerator:
             pos += self.batch_size
             self.fetch_queue.put(buf)
 
-    def __iter__(self):
-        self.total = 0
-        while True:
-            buf = self.fetch_queue.get()
-            self.total += self.batch_size
-            inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-            targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
-            yield inputs, targets
+    def __next__(self):
+        buf = self.fetch_queue.get()
+        self.total += self.batch_size
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
+        return inputs, targets
 
     @torch.no_grad()
     def feedback(self, tokens, losses):
@@ -527,7 +524,7 @@ class DistributedDataGenerator:
             if self.replay_iter <= self.replay_start * 0.5:
                 continue
 
-            # Insert additional splits if documents are too long (>144 tokens)
+            # Insert additional splits if documents are too long
             new_boundaries = []
             for start, end in zip(doc_boundaries[:-1], doc_boundaries[1:]):
                 if start + 1 >= end: continue
@@ -554,7 +551,7 @@ class DistributedDataGenerator:
             scores = 1.0 / torch.log1p(self.feedback_stats[tokens])
             doc_losses = []
             for start, end in zip(doc_start, doc_end):
-                l = (losses[abs(start)+1:abs(end)] * scores[abs(start)+1:abs(end)]).mean()
+                l = losses[abs(start)+1:abs(end)].mean() * scores[abs(start)+1:abs(end)].mean()
                 doc_losses.append(l)
 
             # Get indices of top N highest losses
@@ -583,7 +580,7 @@ class Hyperparameters:
     train_seq_len = 4*64*1024 # FlexAttention sequence length
     val_seq_len = 64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 7500 # number of iterations to run
+    num_iterations = 7150 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
@@ -707,7 +704,6 @@ del initial_state
 ########################################
 
 train_loader = DistributedDataGenerator(args.train_files, world_size * args.train_seq_len, rank, world_size)
-train_loader_iter = iter(train_loader)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -726,7 +722,7 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = iter(DistributedDataGenerator(args.val_files, val_batch_size, rank, world_size))
+        val_loader = DistributedDataGenerator(args.val_files, val_batch_size, rank, world_size)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
@@ -772,8 +768,7 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    if (step+1) % 5 == 0:
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
